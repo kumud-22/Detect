@@ -1,0 +1,287 @@
+// VISION LAB — app.js
+// Loaded by index.html as <script type="module" src="./app.js">.
+// Expects a backend (e.g. on Render) exposing:
+//   POST /api/init-webrtc  -> proxies Roboflow WebRTC init using ROBOFLOW_API_KEY (server-side only)
+//   GET  /api/health       -> { ok: true, apiKeyConfigured: true }
+import { connectors, webrtc, streams } from "https://esm.sh/@roboflow/inference-sdk";
+
+const $ = (id) => document.getElementById(id);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+const THEMES = {
+  cyan: ["#42e8ff", "66,232,255"], purple: ["#b78cff", "183,140,255"], emerald: ["#3ee6b0", "62,230,176"],
+  red: ["#ff718c", "255,113,140"], amber: ["#ffca70", "255,202,112"],
+};
+const TITLES = { vision: "Live Vision", dashboard: "Dashboard", history: "Reading History", pipeline: "Inference Pipeline", settings: "Settings", system: "System Status" };
+const PIPELINE_FIELDS = ["inferenceMode", "modelId", "workspaceName", "workflowId", "imageInputName", "streamOutputNames", "dataOutputNames", "requestedRegion", "requestedPlan", "processingTimeout", "confidenceThreshold"];
+
+const state = { connection: null, camera: null, running: false, total: 0, classes: new Set(), lastLogged: {}, lastRender: 0, history: load("vl.history", []) };
+
+/* ---------- navigation ---------- */
+function go(view) {
+  $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${view}`));
+  $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  $("pageTitle").textContent = TITLES[view] || "Vision Lab";
+  if (view === "system") checkHealth();
+}
+$$(".nav-btn").forEach((b) => b.addEventListener("click", () => go(b.dataset.view)));
+$$("[data-go]").forEach((b) => b.addEventListener("click", () => go(b.dataset.go)));
+$("openPipelineBtn").addEventListener("click", () => go("pipeline"));
+$("openSettingsBtn").addEventListener("click", () => go("settings"));
+
+/* ---------- status helpers ---------- */
+function setStatus(text, tone = "idle") {
+  const color = { idle: "#71809a", live: "#3ee6b0", busy: "#ffca70", error: "#ff718c" }[tone];
+  $("status").textContent = text;
+  for (const id of ["headerDot", "feedDot", "systemDot"]) {
+    $(id).style.background = color;
+    $(id).style.boxShadow = tone === "idle" ? "none" : `0 0 12px ${color}`;
+  }
+  $("feedState").textContent = { idle: "STANDBY", live: "LIVE", busy: "CONNECTING", error: "ERROR" }[tone];
+  $("systemLabel").textContent = { idle: "System ready", live: "Streaming", busy: "Connecting…", error: "Error" }[tone];
+  $("systemStream").textContent = { idle: "Idle", live: "Active", busy: "Connecting", error: "Error" }[tone];
+}
+function setRunning(on) {
+  state.running = on;
+  $("startBtn").disabled = on;
+  $("stopBtn").disabled = !on;
+}
+
+/* ---------- pipeline config ---------- */
+function readConfig() {
+  const c = {};
+  PIPELINE_FIELDS.forEach((id) => (c[id] = $(id).value));
+  return c;
+}
+function applyConfig(c) {
+  PIPELINE_FIELDS.forEach((id) => { if (c[id] !== undefined) $(id).value = c[id]; });
+  syncPipelineUI();
+}
+function syncPipelineUI() {
+  const dynamic = $("inferenceMode").value === "dynamic";
+  const pct = `${$("confidenceThreshold").value}%`;
+  $("modelIdField").classList.toggle("hidden", !dynamic);
+  $("confidenceThreshold").disabled = !dynamic;
+  $("thresholdLabel").textContent = pct;
+  $("thresholdMetric").textContent = dynamic ? pct : "Saved";
+  $("dashThreshold").textContent = dynamic ? pct : "Saved";
+}
+const list = (v) => v.split(",").map((s) => s.trim()).filter(Boolean);
+
+function buildWorkflowSpec(c) {
+  return {
+    version: "1.0",
+    inputs: [{ type: "InferenceImage", name: c.imageInputName }],
+    steps: [
+      { type: "roboflow_core/roboflow_object_detection_model@v2", name: "model", images: `$inputs.${c.imageInputName}`, model_id: c.modelId.trim(), confidence: Number(c.confidenceThreshold) / 100 },
+      { type: "roboflow_core/bounding_box_visualization@v1", name: "boxes", image: `$inputs.${c.imageInputName}`, predictions: "$steps.model.predictions" },
+      { type: "roboflow_core/label_visualization@v1", name: "labels", image: "$steps.boxes.image", predictions: "$steps.model.predictions" },
+    ],
+    outputs: [
+      { type: "JsonField", name: list(c.streamOutputNames)[0] || "output_image", selector: "$steps.labels.image" },
+      { type: "JsonField", name: list(c.dataOutputNames)[0] || "predictions", selector: "$steps.model.predictions" },
+    ],
+  };
+}
+
+/* ---------- detections ---------- */
+function extractPredictions(data) {
+  const out = data?.serialized_output_data ?? data?.output_data ?? data ?? {};
+  const name = list($("dataOutputNames").value)[0] || "predictions";
+  let p = out[name] ?? out.predictions;
+  if (p && !Array.isArray(p)) p = p.predictions;
+  return Array.isArray(p) ? p : [];
+}
+
+function onData(data) {
+  const preds = extractPredictions(data);
+  const now = Date.now();
+  state.total += preds.length;
+  // Best confidence per class in this frame
+  const best = new Map();
+  for (const p of preds) {
+    const cls = p.class ?? p.class_name ?? "unknown";
+    const conf = Number(p.confidence ?? 0);
+    if (conf > (best.get(cls) ?? -1)) best.set(cls, conf);
+  }
+  for (const [cls, conf] of best) {
+    state.classes.add(cls);
+    if (now - (state.lastLogged[cls] || 0) > 3000) { // at most one history event / class / 3s
+      state.lastLogged[cls] = now;
+      state.history.unshift({ cls, conf, t: now });
+    }
+  }
+  state.history = state.history.slice(0, 200);
+  if (now - state.lastRender > 250) { // throttle DOM work
+    state.lastRender = now;
+    renderDetections(best);
+    renderCounters();
+    save("vl.history", state.history);
+    renderHistory();
+  }
+}
+
+function renderDetections(best) {
+  $("visibleCount").textContent = `${best.size} item${best.size === 1 ? "" : "s"}`;
+  if (!best.size) {
+    $("detectionList").innerHTML = '<div class="empty-state">Nothing detected right now.</div>';
+    return;
+  }
+  const minimal = $("boxStyleSelect").value === "minimal";
+  $("detectionList").innerHTML = [...best].sort((a, b) => b[1] - a[1]).map(([cls, conf]) => {
+    const pct = Math.round(conf * 100);
+    return `<div class="detection-item"><div class="detection-top"><span class="detection-name">${esc(cls)}</span><span class="confidence">${pct}%</span></div>${minimal ? "" : `<div class="meter"><span style="width:${pct}%"></span></div>`}</div>`;
+  }).join("");
+}
+
+function renderCounters() {
+  $("totalDetections").textContent = state.total;
+  $("uniqueClasses").textContent = $("dashClasses").textContent = state.classes.size;
+  $("dashEvents").textContent = state.history.length;
+}
+
+function renderHistory() {
+  const q = $("historySearch").value.trim().toLowerCase();
+  const rows = state.history.filter((h) => h.cls.toLowerCase().includes(q));
+  $("historyList").innerHTML = rows.length
+    ? rows.map((h) => `<div class="history-row"><div><div class="history-title">${esc(h.cls)}</div><div class="history-meta">${new Date(h.t).toLocaleString()}</div></div><div class="history-confidence">${Math.round(h.conf * 100)}%</div></div>`).join("")
+    : '<div class="empty-state">History will appear when detections arrive.</div>';
+  $("dashboardRecent").textContent = state.history.length ? state.history.slice(0, 5).map((h) => h.cls).join(", ") : "No detection events recorded yet.";
+  $("dashEvents").textContent = state.history.length;
+}
+
+/* ---------- stream lifecycle ---------- */
+async function start() {
+  if (state.running) return;
+  const c = readConfig();
+  if (c.inferenceMode === "dynamic" && !c.modelId.trim()) return setStatus("Enter a Roboflow model ID first", "error");
+  setRunning(true);
+  setStatus("Connecting…", "busy");
+  $("feedHint").textContent = "Requesting camera access…";
+  try {
+    state.camera = await streams.useCamera({ video: { facingMode: "environment" }, audio: false });
+    const wrtcParams = {
+      imageInputName: c.imageInputName,
+      streamOutputNames: list(c.streamOutputNames),
+      dataOutputNames: list(c.dataOutputNames),
+      requestedRegion: c.requestedRegion,
+      requestedPlan: c.requestedPlan,
+      processingTimeout: Number(c.processingTimeout),
+      ...(c.inferenceMode === "dynamic"
+        ? { workflowSpec: buildWorkflowSpec(c) }
+        : { workspaceName: c.workspaceName.trim(), workflowId: c.workflowId.trim() }),
+    };
+    state.connection = await webrtc.useStream({
+      source: state.camera,
+      connector: connectors.withProxyUrl("/api/init-webrtc"),
+      wrtcParams,
+      onData,
+    });
+    const remote = await state.connection.remoteStream();
+    $("video").srcObject = remote;
+    await $("video").play().catch(() => {});
+    $("feedPlaceholder").classList.add("hidden");
+    $("feedHint").textContent = "Receiving processed video from Roboflow.";
+    setStatus("Live", "live");
+  } catch (err) {
+    console.error(err);
+    await stop(false);
+    setStatus(`Failed: ${err.message || err}`, "error");
+    $("feedHint").textContent = "Could not start. Check camera permission, model ID and backend.";
+  }
+}
+
+async function stop(resetStatus = true) {
+  try { await state.connection?.cleanup(); } catch {}
+  state.camera?.getTracks().forEach((t) => t.stop());
+  state.connection = state.camera = null;
+  $("video").srcObject = null;
+  $("feedPlaceholder").classList.remove("hidden");
+  $("feedHint").textContent = "Camera is not connected.";
+  $("detectionList").innerHTML = '<div class="empty-state">No detections yet.<br/>Start the camera to see recognized objects here.</div>';
+  $("visibleCount").textContent = "0 items";
+  setRunning(false);
+  if (resetStatus) setStatus("Ready — click Start", "idle");
+}
+
+async function restartIfRunning() {
+  if (!state.running) return;
+  await stop(false);
+  await start();
+}
+
+$("startBtn").addEventListener("click", start);
+$("stopBtn").addEventListener("click", () => stop());
+
+/* ---------- pipeline controls ---------- */
+$("inferenceMode").addEventListener("change", syncPipelineUI);
+let thresholdTimer;
+$("confidenceThreshold").addEventListener("input", syncPipelineUI);
+$("confidenceThreshold").addEventListener("change", () => {
+  if ($("inferenceMode").value !== "dynamic") return;
+  clearTimeout(thresholdTimer);
+  thresholdTimer = setTimeout(() => { save("vl.pipeline", readConfig()); restartIfRunning(); }, 400);
+});
+$("savePipelineBtn").addEventListener("click", () => { save("vl.pipeline", readConfig()); setStatus("Configuration saved", state.running ? "live" : "idle"); });
+$("applyPipelineBtn").addEventListener("click", async () => { save("vl.pipeline", readConfig()); state.running ? await restartIfRunning() : go("vision"); });
+
+/* ---------- appearance ---------- */
+function applyAppearance(s) {
+  const [hex, rgb] = THEMES[s.theme] || THEMES.cyan;
+  document.documentElement.style.setProperty("--accent", hex);
+  document.documentElement.style.setProperty("--accent-rgb", rgb);
+  $$(".theme-btn").forEach((b) => b.classList.toggle("active", b.dataset.theme === s.theme));
+  $("densitySelect").value = s.density;
+  $("boxStyleSelect").value = s.boxStyle;
+  $("showSidebar").checked = s.showSidebar;
+  document.querySelector("main").style.padding = s.density === "compact" ? "14px" : "";
+  const grid = document.querySelector(".grid-main");
+  grid.querySelector(":scope > aside").classList.toggle("hidden", !s.showSidebar);
+  grid.style.gridTemplateColumns = s.showSidebar ? "" : "minmax(0,1fr)";
+}
+const readAppearance = () => ({
+  theme: $$(".theme-btn").find((b) => b.classList.contains("active"))?.dataset.theme || "cyan",
+  density: $("densitySelect").value, boxStyle: $("boxStyleSelect").value, showSidebar: $("showSidebar").checked,
+});
+$$(".theme-btn").forEach((b) => b.addEventListener("click", () => {
+  $$(".theme-btn").forEach((x) => x.classList.toggle("active", x === b));
+  applyAppearance(readAppearance());
+}));
+$("saveSettingsBtn").addEventListener("click", () => { const s = readAppearance(); applyAppearance(s); save("vl.appearance", s); });
+
+/* ---------- history ---------- */
+$("historySearch").addEventListener("input", renderHistory);
+$("clearHistoryBtn").addEventListener("click", () => {
+  if (!confirm("Clear all saved detection history?")) return;
+  state.history = []; state.classes.clear(); state.total = 0; state.lastLogged = {};
+  save("vl.history", []);
+  renderHistory(); renderCounters();
+});
+
+/* ---------- backend health ---------- */
+async function checkHealth() {
+  $("backendState").textContent = "Checking";
+  try {
+    const r = await fetch("/api/health", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json().catch(() => ({}));
+    $("backendState").textContent = "Online";
+    const keyOk = j.apiKeyConfigured ?? j.api_key_configured ?? j.hasApiKey;
+    $("apiKeyState").textContent = keyOk === undefined ? "Not reported" : keyOk ? "Configured" : "Missing";
+  } catch {
+    $("backendState").textContent = "Unreachable";
+    $("apiKeyState").textContent = "Not verified";
+  }
+}
+$("healthCheckBtn").addEventListener("click", checkHealth);
+
+/* ---------- init ---------- */
+applyConfig(load("vl.pipeline", {}));
+applyAppearance({ theme: "cyan", density: "comfortable", boxStyle: "normal", showSidebar: true, ...load("vl.appearance", {}) });
+renderCounters();
+renderHistory();
+setStatus("Ready — click Start", "idle");
+window.addEventListener("beforeunload", () => { state.camera?.getTracks().forEach((t) => t.stop()); });
