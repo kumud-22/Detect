@@ -584,8 +584,10 @@ function startVideoProgressWatchdog() {
     if (!connection || starting || stopping || recoveryInProgress) return;
 
     const video = els.video;
-    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    if (!video) return;
 
+    // Do not skip the stall check when readyState drops: a frozen/disconnected
+    // remote stream can lose HAVE_CURRENT_DATA, which otherwise disables recovery.
     const currentTime = video.currentTime || 0;
     if (currentTime > lastVideoTime + 0.01) {
       lastVideoTime = currentTime;
