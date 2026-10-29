@@ -345,8 +345,8 @@ function buildDynamicWorkflow(modelId, confidence, workspaceName) {
 // ============================================================
 
 function getCameraConfig() {
-  // Diagnostic low-latency profile: cap incoming frames and resolution so the
-  // inference worker has less work queued. This favors fresh frames over smoothness.
+  // Balanced live profile: allow up to 15 FPS while keeping resolution bounded
+  // to limit inference workload and improve motion smoothness.
   const resolution = $("resolutionSelect")?.value?.split("x") || [];
   const requestedWidth = Number.parseInt(resolution[0], 10) || 640;
   const requestedHeight = Number.parseInt(resolution[1], 10) || 360;
@@ -355,7 +355,7 @@ function getCameraConfig() {
     deviceId: $("cameraSelect")?.value || undefined,
     width: Math.min(requestedWidth, 640),
     height: Math.min(requestedHeight, 360),
-    frameRate: 5
+    frameRate: 15
   };
 }
 
@@ -409,7 +409,7 @@ async function connectToRoboflow() {
   const videoConstraints = {
     width: { ideal: camera.width, max: 640 },
     height: { ideal: camera.height, max: 360 },
-    frameRate: { ideal: 5, max: 5 }
+    frameRate: { ideal: 15, max: 15 }
   };
 
   if (camera.deviceId) {
