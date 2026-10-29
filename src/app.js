@@ -345,18 +345,17 @@ function buildDynamicWorkflow(modelId, confidence, workspaceName) {
 // ============================================================
 
 function getCameraConfig() {
-  // Use VGA input with a moderate frame rate. A 5 FPS cap can make the
-  // displayed processed video visibly choppy; 10 FPS is a compromise for
-  // real-time inference while keeping the input workload bounded.
+  // Diagnostic low-latency profile: cap incoming frames and resolution so the
+  // inference worker has less work queued. This favors fresh frames over smoothness.
   const resolution = $("resolutionSelect")?.value?.split("x") || [];
   const requestedWidth = Number.parseInt(resolution[0], 10) || 640;
-  const requestedHeight = Number.parseInt(resolution[1], 10) || 480;
+  const requestedHeight = Number.parseInt(resolution[1], 10) || 360;
 
   return {
     deviceId: $("cameraSelect")?.value || undefined,
     width: Math.min(requestedWidth, 640),
-    height: Math.min(requestedHeight, 480),
-    frameRate: 10
+    height: Math.min(requestedHeight, 360),
+    frameRate: 5
   };
 }
 
@@ -409,8 +408,8 @@ async function connectToRoboflow() {
 
   const videoConstraints = {
     width: { ideal: camera.width, max: 640 },
-    height: { ideal: camera.height, max: 480 },
-    frameRate: { ideal: 10, max: 10 }
+    height: { ideal: camera.height, max: 360 },
+    frameRate: { ideal: 5, max: 5 }
   };
 
   if (camera.deviceId) {
