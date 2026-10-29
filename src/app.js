@@ -69,6 +69,12 @@ let history = loadJSON(STORAGE.history, []);
 let lastHealth = null;
 let pendingInferenceData = null;
 let inferenceUiTimer = null;
+let videoProgressWatchdog = null;
+let lastVideoTime = -1;
+let lastVideoProgressAt = 0;
+let recoveryAttempts = 0;
+let recoveryInProgress = false;
+const MAX_AUTO_RECOVERIES = 2;
 let lastHistorySignature = "";
 let lastHistoryWriteAt = 0;
 
@@ -461,9 +467,10 @@ async function connectToRoboflow() {
 // START AND STOP
 // ============================================================
 
-async function startStream() {
-  if (starting || connection) return;
+async function startStream(isAutomaticRecovery = false) {
+  if (starting || connection || stopping) return;
 
+  if (!isAutomaticRecovery) recoveryAttempts = 0;
   starting = true;
   setButtonState();
   setStatus("Requesting camera permission...", "connecting");
@@ -497,6 +504,7 @@ async function startStream() {
     els.feedHint.textContent = "Live processed video from Roboflow.";
     setStatus("Live — inference is running.", "live");
     els.feedState.textContent = "LIVE";
+    startVideoProgressWatchdog();
 
   } catch (error) {
     console.error("[VISION LAB] Start failed:", error);
@@ -519,7 +527,16 @@ async function startStream() {
 }
 
 async function stopStream() {
-  if (!connection || stopping) return;
+  if (stopping) return;
+
+  clearVideoProgressWatchdog();
+  if (!connection) {
+    if (els.video.srcObject) {
+      els.video.pause();
+      els.video.srcObject = null;
+    }
+    return;
+  }
 
   stopping = true;
   const current = connection;
@@ -549,7 +566,65 @@ async function stopStream() {
   }
 }
 
-els.start.addEventListener("click", startStream);
+// Monitor actual video-frame progress: WebRTC may remain connected while
+// the processed video is frozen. Recovery is deliberately capped.
+function clearVideoProgressWatchdog() {
+  if (videoProgressWatchdog !== null) {
+    window.clearInterval(videoProgressWatchdog);
+    videoProgressWatchdog = null;
+  }
+}
+
+function startVideoProgressWatchdog() {
+  clearVideoProgressWatchdog();
+  lastVideoTime = els.video.currentTime || 0;
+  lastVideoProgressAt = Date.now();
+
+  videoProgressWatchdog = window.setInterval(async () => {
+    if (!connection || starting || stopping || recoveryInProgress) return;
+
+    const video = els.video;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
+    const currentTime = video.currentTime || 0;
+    if (currentTime > lastVideoTime + 0.01) {
+      lastVideoTime = currentTime;
+      lastVideoProgressAt = Date.now();
+      return;
+    }
+
+    if (Date.now() - lastVideoProgressAt < 15000) return;
+
+    if (recoveryAttempts >= MAX_AUTO_RECOVERIES) {
+      clearVideoProgressWatchdog();
+      setStatus("Video appears frozen. Automatic recovery limit reached; click Stop, then Start.", "error");
+      els.feedHint.textContent = "No new video frames are arriving. Restart manually to avoid repeated inference sessions.";
+      return;
+    }
+
+    recoveryInProgress = true;
+    recoveryAttempts += 1;
+    reconnecting = true;
+    clearVideoProgressWatchdog();
+    const attempt = recoveryAttempts;
+    setStatus(`Video stalled — reconnecting (attempt ${attempt}/${MAX_AUTO_RECOVERIES})...`, "connecting");
+    els.feedHint.textContent = "No new video frames received; safely restarting the stream.";
+
+    try {
+      await stopStream();
+      await new Promise(resolve => window.setTimeout(resolve, 1000 * attempt));
+      await startStream(true);
+    } catch (error) {
+      console.error("[VISION LAB] Automatic recovery failed:", error);
+      setStatus("Automatic recovery failed. Click Start to try again.", "error");
+    } finally {
+      reconnecting = false;
+      recoveryInProgress = false;
+    }
+  }, 5000);
+}
+
+els.start.addEventListener("click", () => startStream(false));
 els.stop.addEventListener("click", stopStream);
 
 // ============================================================
@@ -1036,6 +1111,7 @@ checkBackendHealth();
 initializeCameraList();
 
 window.addEventListener("pagehide", () => {
+  clearVideoProgressWatchdog();
   if (connection) {
     connection.cleanup().catch(error => {
       console.warn("[Page cleanup]", error);
