@@ -421,10 +421,25 @@ async function connectToRoboflow() {
     { turnConfigUrl: "/api/turn-config" }
   );
 
+  // Acquire and display the local camera first. This lets the visitor see
+  // that camera permission worked while the Roboflow/WebRTC pipeline starts.
   const source = await streams.useCamera({
     video: videoConstraints,
     audio: false
   });
+
+  if (source && els.video) {
+    els.video.srcObject = source;
+    els.video.muted = true;
+    els.video.autoplay = true;
+    els.video.playsInline = true;
+    els.placeholder?.classList.add("hidden");
+    els.feedHint.textContent = "Camera ready — connecting to Roboflow for live detection...";
+    setStatus("Camera ready; starting inference...", "connecting");
+    els.video.play().catch(error => {
+      console.warn("[Video] Local camera preview could not start:", error);
+    });
+  }
 
   try {
     return await webrtc.useStream({
@@ -451,14 +466,16 @@ async function startStream() {
 
   starting = true;
   setButtonState();
-  setStatus("Connecting camera and inference workflow...", "connecting");
-  els.feedHint.textContent = "Waiting for camera and Roboflow connection...";
+  setStatus("Requesting camera permission...", "connecting");
+  els.feedHint.textContent = "Opening camera...";
   els.placeholder.classList.remove("hidden");
 
   try {
+    setStatus("Connecting to Roboflow inference...", "connecting");
     const newConnection = await connectToRoboflow();
     connection = newConnection;
 
+    els.feedHint.textContent = "Camera connected — waiting for processed inference video...";
     const remoteStream = await newConnection.remoteStream();
 
     if (!remoteStream) {
